@@ -139,8 +139,9 @@ def fetch_twelve_h1(symbol: str, outputsize: int = 200) -> pd.DataFrame:
             return pd.DataFrame()
         df = pd.DataFrame(js["values"])
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-        for c in ("open", "high", "low", "close"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in ("open", "high", "low", "close", "volume"):
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime")
         return df.reset_index(drop=True)
     except Exception:
@@ -334,8 +335,34 @@ def daily_range_pips(df: pd.DataFrame, d: date) -> Optional[float]:
     return float((day["high"].max() - day["low"].min()) / PIP)
 
 
-def causal_swings(df: pd.DataFrame, w: int = SWING_W) -> tuple[list[float], list[float]]:
-    """Confirmed swings only at j+w."""
+# ---------------------------------------------------------------------------
+# RESEARCH LEVEL ENGINE (exact formulas from Confluence / Complete S&R reports)
+# Original (non-Gann) confluence preferred — Gann did not raise high-conf success.
+# Refined Level = Σ(Pi × Wi) / Σ Wi
+# Cluster if Pi+1 − Pi ≤ 0.0013 (13 pips); keep clusters with Score = Σ Wi ≥ 5.5
+# High-confluence operational threshold ≥ 8.0
+# Nearer-first is applied ONLY to these refined levels (as tested).
+# ---------------------------------------------------------------------------
+CLUSTER_DIST = 0.0013  # 13 pips
+MIN_CLUSTER_SCORE = 5.5
+HIGH_CONF_SCORE = 8.0
+EQUAL_TOL = 0.0008  # 8 pips
+OB_BODY_PIPS = 14.0
+VOL_WINDOW = 40
+VOL_TOP_N = 6
+
+# Weights from research (Original / Institutional blend — non-Gann core)
+W_SWING = 3.0
+W_ROUND = 2.0
+W_VOLUME = 1.3
+W_EQUAL = 3.5
+W_ORDERBLOCK = 2.8
+
+
+def causal_swings_indexed(
+    df: pd.DataFrame, w: int = SWING_W
+) -> tuple[list[tuple[float, int]], list[tuple[float, int]]]:
+    """Causal swings: level confirmed only at j+w. Returns (price, confirm_index)."""
     highs, lows = [], []
     if df is None or len(df) < 2 * w + 3:
         return highs, lows
@@ -343,53 +370,210 @@ def causal_swings(df: pd.DataFrame, w: int = SWING_W) -> tuple[list[float], list
     l = df["low"].astype(float).values
     n = len(df)
     for j in range(w, n - w):
-        window_h = h[j - w : j + w + 1]
-        window_l = l[j - w : j + w + 1]
-        if h[j] == window_h.max():
-            highs.append(float(h[j]))
-        if l[j] == window_l.min():
-            lows.append(float(l[j]))
-    return highs[-8:], lows[-8:]
+        if h[j] == h[j - w : j + w + 1].max():
+            highs.append((float(h[j]), j + w))
+        if l[j] == l[j - w : j + w + 1].min():
+            lows.append((float(l[j]), j + w))
+    return highs[-12:], lows[-12:]
 
 
-def round_levels(price: float, step: float = ROUND_STEP, n: int = 6) -> list[float]:
-    base = round(price / step) * step
-    return [round(base + k * step, 5) for k in range(-n, n + 1)]
+def model_swings(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """(price, weight) from latest swing highs/lows."""
+    sh, sl = causal_swings_indexed(df, SWING_W)
+    out: list[tuple[float, float]] = []
+    for p, _ in sh[-4:]:
+        out.append((p, W_SWING))
+    for p, _ in sl[-4:]:
+        out.append((p, W_SWING))
+    return out
+
+
+def model_rounds(price: float) -> list[tuple[float, float]]:
+    """Rk = round(P/0.005)*0.005 + k*0.005, k=-5..+5."""
+    base = round(price / ROUND_STEP) * ROUND_STEP
+    return [(round(base + k * ROUND_STEP, 5), W_ROUND) for k in range(-5, 6)]
+
+
+def model_volume_proxy(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """Highs+Lows of top-N volume bars in last 25–40 bars."""
+    if df is None or len(df) < 10:
+        return []
+    tail = df.tail(VOL_WINDOW).copy()
+    if "volume" not in tail.columns or tail["volume"].isna().all():
+        # Fallback: use range as activity proxy when volume missing
+        tail = tail.copy()
+        tail["_act"] = (tail["high"].astype(float) - tail["low"].astype(float)).abs()
+        top = tail.nlargest(VOL_TOP_N, "_act")
+    else:
+        tail["volume"] = pd.to_numeric(tail["volume"], errors="coerce").fillna(0)
+        top = tail.nlargest(VOL_TOP_N, "volume")
+    out: list[tuple[float, float]] = []
+    for _, row in top.iterrows():
+        out.append((float(row["high"]), W_VOLUME))
+        out.append((float(row["low"]), W_VOLUME))
+    return out
+
+
+def model_equal_pools(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """Equal highs/lows: cluster swings within 8 pips; level = mean; min 2 members."""
+    sh, sl = causal_swings_indexed(df, SWING_W)
+    out: list[tuple[float, float]] = []
+
+    def pools(levels: list[float]) -> list[float]:
+        if len(levels) < 2:
+            return []
+        s = sorted(levels)
+        groups: list[list[float]] = [[s[0]]]
+        for x in s[1:]:
+            if x - groups[-1][-1] <= EQUAL_TOL:
+                groups[-1].append(x)
+            else:
+                groups.append([x])
+        return [sum(g) / len(g) for g in groups if len(g) >= 2]
+
+    out.extend((p, W_EQUAL) for p in pools([x for x, _ in sh]))
+    out.extend((p, W_EQUAL) for p in pools([x for x, _ in sl]))
+    return out
+
+
+def model_order_blocks(df: pd.DataFrame) -> list[tuple[float, float]]:
+    """
+    Bullish OB: last down-close before impulsive up (body > 14 pips).
+    Bearish OB: last up-close before impulsive down.
+    Level = (H+L)/2 of OB candle.
+    """
+    if df is None or len(df) < 8:
+        return []
+    o = df["open"].astype(float).values
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    c = df["close"].astype(float).values
+    out: list[tuple[float, float]] = []
+    n = len(df)
+    body_min = OB_BODY_PIPS * PIP
+    # scan recent history only
+    start = max(2, n - 80)
+    for i in range(start, n - 1):
+        body = abs(c[i] - o[i])
+        if body < body_min:
+            continue
+        # impulsive up after down-close
+        if c[i] < o[i] and c[i + 1] > o[i + 1] and (c[i + 1] - o[i + 1]) >= body_min * 0.8:
+            mid = (h[i] + l[i]) / 2.0
+            out.append((float(mid), W_ORDERBLOCK))
+        # impulsive down after up-close
+        if c[i] > o[i] and c[i + 1] < o[i + 1] and (o[i + 1] - c[i + 1]) >= body_min * 0.8:
+            mid = (h[i] + l[i]) / 2.0
+            out.append((float(mid), W_ORDERBLOCK))
+    return out[-8:]
+
+
+def cluster_weighted(
+    candidates: list[tuple[float, float]],
+    dist: float = CLUSTER_DIST,
+    min_score: float = MIN_CLUSTER_SCORE,
+) -> list[dict[str, float]]:
+    """
+    Sort by price. Group while Pi+1 - Pi ≤ dist.
+    Refined = Σ(Pi×Wi)/ΣWi ; Score = ΣWi ; keep Score ≥ min_score.
+    """
+    if not candidates:
+        return []
+    # merge duplicate prices by summing weights
+    bucket: dict[float, float] = {}
+    for p, w in candidates:
+        key = round(float(p), 5)
+        bucket[key] = bucket.get(key, 0.0) + float(w)
+    items = sorted(bucket.items(), key=lambda x: x[0])  # (price, weight)
+
+    clusters: list[list[tuple[float, float]]] = [[items[0]]]
+    for p, w in items[1:]:
+        if p - clusters[-1][-1][0] <= dist:
+            clusters[-1].append((p, w))
+        else:
+            clusters.append([(p, w)])
+
+    refined: list[dict[str, float]] = []
+    for cl in clusters:
+        sw = sum(w for _, w in cl)
+        if sw < min_score:
+            continue
+        centre = sum(p * w for p, w in cl) / sw
+        refined.append(
+            {
+                "level": float(centre),
+                "score": float(sw),
+                "width": float(cl[-1][0] - cl[0][0]),
+                "n": float(len(cl)),
+            }
+        )
+    return refined
 
 
 def build_levels(df: pd.DataFrame, price: float) -> dict[str, Any]:
-    """Combine causal swings + rounds → nearest R / S."""
-    sh, sl = causal_swings(df, SWING_W)
-    rounds = round_levels(price)
+    """
+    Research confluence levels (Original non-Gann stack) + nearer-first.
+    This is the same mathematical path the sequence tests used:
+      candidates → 13-pip clusters → weighted centre → R/S → nearer.
+    """
+    price = float(price)
+    candidates: list[tuple[float, float]] = []
+    candidates.extend(model_swings(df))
+    candidates.extend(model_rounds(price))
+    candidates.extend(model_volume_proxy(df))
+    candidates.extend(model_equal_pools(df))
+    candidates.extend(model_order_blocks(df))
+
+    all_clusters = cluster_weighted(candidates, CLUSTER_DIST, MIN_CLUSTER_SCORE)
+    high_conf = [c for c in all_clusters if c["score"] >= HIGH_CONF_SCORE]
+
     buffer = 3 * PIP
-    res_cands = [x for x in sh + rounds if x > price + buffer]
-    sup_cands = [x for x in sl + rounds if x < price - buffer]
-    R = min(res_cands) if res_cands else None
-    S = max(sup_cands) if sup_cands else None
-    nearer = None
-    nearer_side = None
+    above = [c for c in all_clusters if c["level"] > price + buffer]
+    below = [c for c in all_clusters if c["level"] < price - buffer]
+    # Prefer higher score when picking nearest; primary key remains distance
+    above.sort(key=lambda c: (c["level"] - price, -c["score"]))
+    below.sort(key=lambda c: (price - c["level"], -c["score"]))
+
+    R = above[0]["level"] if above else None
+    R_score = above[0]["score"] if above else None
+    S = below[0]["level"] if below else None
+    S_score = below[0]["score"] if below else None
+
+    nearer = nearer_side = None
+    nearer_score = None
     if R is not None and S is not None:
         if abs(R - price) <= abs(price - S):
-            nearer, nearer_side = R, "R"
+            nearer, nearer_side, nearer_score = R, "R", R_score
         else:
-            nearer, nearer_side = S, "S"
+            nearer, nearer_side, nearer_score = S, "S", S_score
     elif R is not None:
-        nearer, nearer_side = R, "R"
+        nearer, nearer_side, nearer_score = R, "R", R_score
     elif S is not None:
-        nearer, nearer_side = S, "S"
-    inv_above = R  # invalidate long thesis if clearly through R with momentum
-    inv_below = S
+        nearer, nearer_side, nearer_score = S, "S", S_score
+
     return {
         "price": price,
         "R": R,
         "S": S,
+        "R_score": R_score,
+        "S_score": S_score,
         "nearer": nearer,
         "nearer_side": nearer_side,
-        "swing_highs": sh,
-        "swing_lows": sl,
-        "rounds": rounds,
-        "invalidation_above": inv_above,
-        "invalidation_below": inv_below,
+        "nearer_score": nearer_score,
+        "invalidation_above": R,
+        "invalidation_below": S,
+        "clusters": all_clusters,
+        "high_conf_clusters": high_conf,
+        "n_candidates": len(candidates),
+        "method": "research_confluence_v1",
+        "formula": "Refined=Σ(Pi·Wi)/ΣWi | cluster≤13pips | min_score≥5.5 | high_conf≥8",
+        "weights": {
+            "swing": W_SWING,
+            "round": W_ROUND,
+            "volume": W_VOLUME,
+            "equal": W_EQUAL,
+            "order_block": W_ORDERBLOCK,
+        },
         "built_at": now_utc().isoformat(),
     }
 
@@ -816,9 +1000,18 @@ def main():
                 else "—",
             )
             st.caption(
-                "R/S from causal swings (W=4 confirm) + 0.005 rounds. "
-                "Nearer-first ≈ 60–65% historical; does not change FE direction."
+                "Research confluence: swings·rounds·volume proxy·equal pools·order blocks → "
+                "cluster ≤13 pips → Refined=Σ(Pi·Wi)/ΣWi (min score 5.5). "
+                "Nearer-first applied to these refined levels only (≈61–64% as tested). "
+                "Does not change FE direction."
             )
+            if levels.get("R_score") is not None or levels.get("S_score") is not None:
+                st.caption(
+                    f"Scores — R: {levels.get('R_score')} · S: {levels.get('S_score')} · "
+                    f"Nearer: {levels.get('nearer_score')} · "
+                    f"High-conf clusters (≥8): {len(levels.get('high_conf_clusters') or [])} · "
+                    f"Candidates: {levels.get('n_candidates')}"
+                )
 
             st.subheader(f"Day {max(day_n, 1 if both.get('both') else 0)} — What to do")
             for a in guide["actions"]:
